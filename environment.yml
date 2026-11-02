@@ -1,0 +1,29 @@
+name: polycats
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - kagglehub
+  # Core data handling
+  - numpy
+  - pandas
+  - pyarrow
+  - openpyxl
+  # Statistics & modelling
+  - scipy
+  - statsmodels
+  - scikit-learn
+  # Visualisation
+  - matplotlib
+  - seaborn
+  - plotly
+  # Notebooks
+  - jupyterlab
+  - jupyter
+  - notebook
+  - ipykernel
+  - ipywidgets
+  # Utilities
+  - tqdm
+  - requests
+  - pip

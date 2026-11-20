@@ -7,6 +7,8 @@ Usage:
     .venv/bin/python annotate.py --dry-run --limit 1  # print the prompt, no model call
 
 Reads games_to_annotate.xlsx and writes games_annotated.xlsx (same columns, filled in).
+On the HPC see annotate_job.sh: --outdir, --resume-from, --shard and --workers let several
+GPU jobs split the games, each saving its own games_annotated.xlsx; merge_job.sh joins them.
 No log is kept. Progress is saved to games_annotated.xlsx every --save-every games and when
 the run stops, and a new run reuses every label already in games_annotated.xlsx (matched by
 BGGId), so a stopped run simply resumes. Use --fresh to ignore existing labels.
@@ -14,11 +16,14 @@ BGGId), so a stopped run simply resumes. Use --fresh to ignore existing labels.
 
 import argparse
 import json
+import os
 import re
+import signal
 import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import openpyxl
@@ -26,8 +31,11 @@ import openpyxl
 HERE = Path(__file__).parent
 INPUT = HERE / "games_to_annotate.xlsx"
 OUTPUT = HERE / "games_annotated.xlsx"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "gemma4:26b-a4b-it-qat"
+# On the HPC the job script sets OLLAMA_HOST to a free port (e.g. 127.0.0.1:41873).
+_host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+OLLAMA_URL = (_host if _host.startswith("http") else f"http://{_host}") + "/api/chat"
+DEFAULT_MODEL = os.environ.get("ANNOTATE_MODEL", "gemma4:26b-a4b-it-qat")
+NUM_CTX = 8192   # tokens the model can see + write; raised with --num-ctx (thinking needs more)
 
 BINARY = ["IsCoherent", "ClearObjective", "ClearWin", "MultipInteract"]
 LABELS = BINARY + ["Confidence"]
@@ -335,7 +343,8 @@ def call_ollama(model: str, messages: list, think: bool) -> dict:
         "messages": messages,
         "format": response_schema(),
         "stream": False,
-        "options": {"temperature": 0, "seed": 42, "num_ctx": 8192},
+        "options": {"temperature": 0, "seed": 42, "num_ctx": NUM_CTX},
+        "keep_alive": "30m",  # keep the model in GPU memory between games
     }
     if think is not None:
         payload["think"] = think
@@ -366,20 +375,37 @@ def annotate(model: str, description: str, think, retries: int = 3) -> dict:
     raise RuntimeError(f"no valid answer after {retries} tries: {last_err}")
 
 
-def previous_labels() -> dict:
-    """Labels already saved in games_annotated.xlsx, keyed by BGGId (complete rows only)."""
-    if not OUTPUT.exists():
-        return {}
-    ws = openpyxl.load_workbook(OUTPUT, read_only=True).active
-    rows = ws.iter_rows(values_only=True)
-    header = list(next(rows))
+def previous_labels(files) -> dict:
+    """Labels already saved in these games_annotated.xlsx files, keyed by BGGId (complete rows only)."""
     done = {}
-    for row in rows:
-        rec = dict(zip(header, row))
-        labels = {k: rec.get(k) for k in LABELS}
-        if rec.get("BGGId") is not None and all(v is not None for v in labels.values()):
-            done[str(rec["BGGId"])] = {k: int(v) for k, v in labels.items()}
+    for f in files:
+        if not f.exists():
+            continue
+        try:
+            ws = openpyxl.load_workbook(f, read_only=True).active
+        except Exception as e:   # e.g. a file another job is replacing right now
+            print(f"Could not read {f}: {e}", flush=True)
+            continue
+        rows = ws.iter_rows(values_only=True)
+        header = list(next(rows))
+        n = 0
+        for row in rows:
+            rec = dict(zip(header, row))
+            labels = {k: rec.get(k) for k in LABELS}
+            if rec.get("BGGId") is not None and all(v is not None for v in labels.values()):
+                done[str(rec["BGGId"])] = {k: int(v) for k, v in labels.items()}
+                n += 1
+        if n:
+            print(f"Reusing {n:,} labelled games from {f}", flush=True)
     return done
+
+
+def shard_of(bgg_id, n: int) -> int:
+    """Stable shard number for a game, so every run splits the games the same way."""
+    try:
+        return int(bgg_id) % n
+    except (TypeError, ValueError):
+        return sum(str(bgg_id).encode()) % n
 
 
 def save(wb):
@@ -393,7 +419,9 @@ def main():
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--limit", type=int, help="annotate at most N games that still need labels")
     ap.add_argument("--dry-run", action="store_true", help="print the prompt, do not call the model")
-    ap.add_argument("--think", choices=["on", "off"], default="off",
+    ap.add_argument("--num-ctx", type=int, default=None,
+                    help="context size in tokens (default 8192, or 32768 when thinking)")
+    ap.add_argument("--think", choices=["on", "off", "low", "medium", "high"], default="off",
                     help="hidden step-by-step thinking (default off: ~4x faster; the short "
                          "per-metric reasons are still written)")
     ap.add_argument("--fresh", action="store_true",
@@ -402,59 +430,102 @@ def main():
                     help="seconds to wait between games (default 1) so the laptop runs cooler")
     ap.add_argument("--save-every", type=int, default=25,
                     help="save games_annotated.xlsx every N games (default 25)")
+    ap.add_argument("--input", default=str(INPUT),
+                    help="spreadsheet to annotate (default: games_to_annotate.xlsx); needs the columns "
+                         "BGGId, Name, description and the 5 label columns")
+    ap.add_argument("--outdir", default=str(HERE),
+                    help="folder to write games_annotated.xlsx in (default: next to this script)")
+    ap.add_argument("--resume-from",
+                    help="also reuse labels from every games_annotated.xlsx below this folder "
+                         "(earlier runs and other shards of the same model)")
+    ap.add_argument("--shard", default="0/1",
+                    help="I/N: only do the games whose BGGId %% N == I, so N jobs can split the work")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="games sent to the model at the same time (needs OLLAMA_NUM_PARALLEL >= this)")
     args = ap.parse_args()
-    think = args.think == "on"
+    # off -> False, on -> True, low/medium/high -> that thinking level (if the model supports it)
+    think = {"off": False, "on": True}.get(args.think, args.think)
+    global NUM_CTX
+    NUM_CTX = args.num_ctx or (8192 if think is False else 32768)
+    global OUTPUT
+    OUTPUT = Path(args.outdir) / "games_annotated.xlsx"
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    shard_i, shard_n = map(int, args.shard.split("/"))
 
-    wb = openpyxl.load_workbook(INPUT)
+    wb = openpyxl.load_workbook(args.input)
     ws = wb.active
     header = [c.value for c in ws[1]]
     col = {name: header.index(name) + 1 for name in header}
 
     # Copy labels saved by earlier runs into the sheet, so those games are skipped.
-    done = {} if args.fresh or args.dry_run else previous_labels()
+    sources = [OUTPUT]
+    if args.resume_from:
+        sources += sorted(Path(args.resume_from).glob("**/games_annotated.xlsx"))
+    done = {} if args.fresh or args.dry_run else previous_labels(dict.fromkeys(sources))
     todo = []
     for r in range(2, ws.max_row + 1):
         labels = done.get(str(ws.cell(r, col["BGGId"]).value))
         if labels:
             for k, v in labels.items():
                 ws.cell(r, col[k]).value = v
-        else:
+        elif shard_of(ws.cell(r, col["BGGId"]).value, shard_n) == shard_i:
             todo.append(r)
-    print(f"{ws.max_row - 1:,} games, {ws.max_row - 1 - len(todo):,} already labelled, "
-          f"{len(todo):,} to do")
+    print(f"{ws.max_row - 1:,} games, {len(done):,} already labelled, "
+          f"{len(todo):,} to do in shard {shard_i}/{shard_n}", flush=True)
     rows = todo[: args.limit]
 
+    def prepare(r):
+        name = ws.cell(r, col["Name"]).value or ""
+        return name, clean(mask_name(ws.cell(r, col["description"]).value or "", name))
+
+    if args.dry_run:
+        for r in rows:
+            for m in build_messages(prepare(r)[1]):
+                print(f"--- {m['role']} ---\n{m['content']}\n")
+        return
+
+    jobs = [(r, *prepare(r)) for r in rows]   # read the sheet here, not in the worker threads
+
+    def work(r, name, desc):
+        if not desc:   # empty description: rated as unreadable, no model call
+            return r, name, {"IsCoherent": 0, "ClearObjective": 0, "ClearWin": 0,
+                             "MultipInteract": 0, "Confidence": 1}, None
+        try:
+            labels = annotate(args.model, desc, think)["labels"]
+        except Exception as e:   # bad answers, timeouts, lost connection: left empty, retried next run
+            return r, name, None, e
+        time.sleep(args.pause)  # let the GPU cool down a little between games
+        return r, name, labels, None
+
+    def stop(signum, frame):   # SLURM sends SIGTERM at the time limit: save, then stop
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+
+    pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+    futures = []
     try:
-        for n, r in enumerate(rows, 1):
-            name = ws.cell(r, col["Name"]).value or ""
-            desc = clean(mask_name(ws.cell(r, col["description"]).value or "", name))
-
-            if args.dry_run:
-                for m in build_messages(desc):
-                    print(f"--- {m['role']} ---\n{m['content']}\n")
+        futures = [pool.submit(work, *j) for j in jobs]
+        for n, fut in enumerate(as_completed(futures), 1):
+            r, name, labels, err = fut.result()
+            if labels is None:
+                print(f"[{n}/{len(rows)}] {name}: skipped ({err})", flush=True)
                 continue
-
-            if not desc:   # empty description: rated as unreadable, no model call
-                labels = {"IsCoherent": 0, "ClearObjective": 0, "ClearWin": 0,
-                          "MultipInteract": 0, "Confidence": 1}
-            else:
-                try:
-                    labels = annotate(args.model, desc, think)["labels"]
-                except RuntimeError as e:   # left empty, retried on the next run
-                    print(f"[{n}/{len(rows)}] {name}: skipped ({e})", flush=True)
-                    continue
-                time.sleep(args.pause)  # let the GPU cool down a little between games
-
-            for k, v in labels.items():
+            for k, v in labels.items():   # only this thread writes to the sheet
                 ws.cell(r, col[k]).value = v
             print(f"[{n}/{len(rows)}] {name}: {labels}", flush=True)
             if n % args.save_every == 0:
                 save(wb)
     finally:
-        if not args.dry_run:
-            save(wb)   # also runs on Ctrl+C or a crash, so finished games are kept
-            print(f"\nSaved {OUTPUT.name} (model: {args.model})")
+        for f in futures:
+            f.cancel()   # games not started yet
+        pool.shutdown(wait=False)
+        save(wb)   # also runs on Ctrl+C, a crash or the job's time limit, so finished games are kept
+        print(f"\nSaved {OUTPUT} (model: {args.model})", flush=True)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:   # stopped (Ctrl+C or SLURM time limit); progress was already saved
+        print("Stopped early; finished games are saved. Submit again to continue.", flush=True)
+        sys.exit(130)

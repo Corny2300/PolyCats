@@ -1,0 +1,21 @@
+\subsection{Ratings}
+
+We use \texttt{AvgRating} to represent game quality. Its mean is 6.42 and its median is 6.45, with the middle 50\% of games rated between 5.84 and 7.05. The Bayesian-adjusted score, \texttt{BayesAvgRating}, has a mean of 5.69 and a more concentrated distribution.
+
+This difference is particularly pronounced among games with fewer user ratings. For games with fewer than 1,000 ratings, the standard deviation is 0.94 for average ratings and 0.13 for Bayesian ratings. Among games with at least 1,000 ratings, the corresponding values are 0.70 and 0.56.
+
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{@{}lrrr@{}}
+        \hline
+        User ratings & Games & Average & Bayesian \\
+        \hline
+        Below 1,000 & 19,012 & 6.34 & 5.58 \\
+        At least 1,000 & 2,913 & 6.95 & 6.39 \\
+        \hline
+    \end{tabular}
+    \caption{Mean average and Bayesian ratings by number of user ratings.}
+    \label{tab:ratings_by_count}
+\end{table}
+
+Games with more user ratings also have higher mean scores, highlighting the importance of considering rating counts when comparing games.
